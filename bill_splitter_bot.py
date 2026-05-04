@@ -298,13 +298,19 @@ def get_unassigned_items(session: dict) -> list:
 
 
 def item_keyboard(session: dict, person_idx: int) -> InlineKeyboardMarkup:
-    """Keyboard showing all non-shared items, ticked if selected for this person."""
     items = session["items"]
-    selected = set(session["assignments"].get(str(person_idx), []))
+    assignments = session["assignments"]
     shared = set(session["shared_items"])
+    selected = set(assignments.get(str(person_idx), []))
+
+    taken_by_others = set()
+    for p_key, idxs in assignments.items():
+        if str(p_key) != str(person_idx):
+            taken_by_others.update(idxs)
+
     buttons = []
     for i, item in enumerate(items):
-        if i in shared:
+        if i in shared or i in taken_by_others:
             continue
         tick = "✅ " if i in selected else ""
         label = f"{tick}{item['name']} — MVR {item['price']:.2f}"
@@ -353,6 +359,21 @@ async def split_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not receipt.get("items"):
         await message.reply_text("❌ No items found in the bill. Try a clearer photo.")
         return
+
+    # Expand multi-quantity items into individual units
+    expanded = []
+    for it in receipt["items"]:
+        qty = max(1, int(it.get("qty", 1)))
+        unit_price = it["price"] / qty
+        for k in range(qty):
+            label_suffix = f" ({k+1}/{qty})" if qty > 1 else ""
+            expanded.append({
+                "name": it["name"] + label_suffix,
+                "price": round(unit_price, 2),
+                "qty": 1,
+                "taxable": it.get("taxable", False),
+            })
+    receipt["items"] = expanded
 
     # Auto-detect water items as shared
     shared_idxs = [i for i, item in enumerate(receipt["items"]) if is_water_item(item["name"])]
