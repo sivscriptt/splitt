@@ -100,55 +100,117 @@ def ocr_with_datalab(image_bytes: bytes) -> str:
 # ─────────────────────────────────────────────
 # REGEX RECEIPT PARSER (no AI quota needed)
 # ─────────────────────────────────────────────
-SKIP = re.compile(
-    r"sub.?total|service.?charge|gst|vat|tax|discount|total|invoice|cashier"
-    r"|table|floor|dine|item\s+qty|thank|scan|powered|unsettled|kot|bot\s+\d",
-    re.IGNORECASE,
-)
-# e.g. "Korean BBQ Dirty Fries  1 pcs T  84.00"  or  "Water 1.5ml  2 pcs  28.00"
+# Pizano format: "Korean BBQ Dirty Fries  1 pcs T  84.00"
 ITEM_LINE = re.compile(
     r"^(.+?)\s+(\d+)\s*pcs?\b\s*(T\b)?\s*([\d,]+\.\d{2})\s*$", re.IGNORECASE
 )
-PRICE_END = re.compile(r"^(.+?)\s+([\d,]+\.\d{2})\s*$")
+# Jim & Carry format: numeric-only row like "134.25  2  228.22" (rate, qty, amount)
+THREE_NUMS = re.compile(
+    r"^([\d,]+[.,]\d{1,3})\s+(\d+)\s+([\d,]+[.,]\d{1,3})\s*$"
+)
+NUMBERS_ONLY = re.compile(r"^[\d,.\s]+$")
+
+
+def parse_num(s: str) -> float:
+    s = s.strip().replace(" ", "")
+    if "." in s and "," in s:
+        return float(s.replace(",", ""))
+    if "," in s and "." not in s:
+        # "264,42" → 264.42  ;  "2,500" → 2500
+        parts = s.split(",")
+        if len(parts[-1]) == 2:
+            return float(s.replace(",", "."))
+        return float(s.replace(",", ""))
+    return float(s)
+
+
+def line_price(line: str) -> float:
+    m = re.search(r"([\d,]+[.,]\d{1,3})\s*$", line)
+    return parse_num(m.group(1)) if m else 0.0
+
+
+def is_total_line(lower: str) -> bool:
+    return any(
+        kw in lower
+        for kw in (
+            "sub total", "subtotal", "service charge", "gst", "vat",
+            "tax amount", "tax (", "net total", "net[", "net $", "net :",
+            "discount", "disc (", "disc:", "tendered", "balance",
+            "grand total", "amount due",
+        )
+    ) or lower.startswith("total")
 
 
 def parse_receipt_text(text: str) -> dict:
     items = []
     subtotal = sc = gst = total = 0.0
 
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         lower = line.lower()
-        if SKIP.search(lower):
-            price_m = re.search(r"([\d,]+\.\d{2})\s*$", line)
-            val = float(price_m.group(1).replace(",", "")) if price_m else 0.0
-            if "sub" in lower and "total" in lower:
-                subtotal = val
-            elif "service" in lower:
-                sc = val
-            elif "gst" in lower or "vat" in lower:
-                gst = val
-            elif "total" in lower:
-                total = val
-            continue
 
+        # Capture totals
+        if "sub" in lower and "total" in lower:
+            subtotal = line_price(line) or subtotal
+            i += 1; continue
+        if "service" in lower and "charge" in lower:
+            sc = line_price(line) or sc
+            i += 1; continue
+        if ("gst" in lower or "tax amount" in lower or "vat" in lower) and "net" not in lower:
+            gst = line_price(line) or gst
+            i += 1; continue
+        if "net total" in lower or ("total" in lower and "sub" not in lower and "net[" not in lower and "net $" not in lower):
+            total = line_price(line) or total
+            i += 1; continue
+
+        # Skip other footer/header lines
+        if is_total_line(lower):
+            i += 1; continue
+        if any(kw in lower for kw in (
+            "invoice", "cashier", "table", "floor", "dine", "tin ", "tin:",
+            "till", "date ", "date:", "time ", "time:", "contact",
+            "fill no", "order taken", "rate", "qt.y", "qty", "amt",
+            "thank", "scan", "powered", "come again", "unsettled",
+            "kot ", "bot ", "bill :", "bill:",
+        )):
+            i += 1; continue
+
+        # Format A: Pizano single-line "Name X pcs [T] price"
         m = ITEM_LINE.match(line)
         if m:
-            name = m.group(1).strip()
-            qty = int(m.group(2))
-            taxable = m.group(3) is not None
-            price = float(m.group(4).replace(",", ""))
-            items.append({"name": name, "price": price, "qty": qty, "taxable": taxable})
-            continue
+            items.append({
+                "name": m.group(1).strip(),
+                "price": parse_num(m.group(4)),
+                "qty": int(m.group(2)),
+                "taxable": m.group(3) is not None,
+            })
+            i += 1; continue
 
-        m = PRICE_END.match(line)
-        if m:
-            name, price = m.group(1).strip(), float(m.group(2).replace(",", ""))
-            if len(name) > 2 and not re.match(r"^[\d\s.]+$", name):
-                items.append({"name": name, "price": price, "qty": 1, "taxable": False})
+        # Format B: Jim & Carry — "rate qty amount" then next line is name
+        m = THREE_NUMS.match(line)
+        if m and i + 1 < len(lines):
+            nxt = lines[i + 1]
+            nxt_lower = nxt.lower()
+            if (not NUMBERS_ONLY.match(nxt) and
+                not is_total_line(nxt_lower) and
+                len(nxt) > 2):
+                items.append({
+                    "name": nxt.strip(),
+                    "price": parse_num(m.group(3)),
+                    "qty": int(m.group(2)),
+                    "taxable": False,
+                })
+                i += 2
+                continue
+
+        i += 1
+
+    # If no T markers but receipt has GST → assume tax applies to all items
+    if gst > 0 and not any(it.get("taxable") for it in items):
+        for it in items:
+            it["taxable"] = True
 
     return {"items": items, "subtotal": subtotal, "gst": gst, "sc": sc, "total": total, "currency": "MVR"}
 
@@ -170,12 +232,12 @@ def calculate_bill(session: dict) -> str:
     people = session["people"]
     assignments = session["assignments"]
     shared_idxs = session["shared_items"]
+    receipt = session.get("receipt", {})
 
     n = len(people)
-    base = [0.0] * n      # full subtotal per person
-    taxable = [0.0] * n   # taxable subtotal per person (T-marked items)
+    base = [0.0] * n
+    taxable = [0.0] * n
 
-    # Shared items split evenly
     if shared_idxs and n > 0:
         shared_total = sum(items[i]["price"] for i in shared_idxs)
         shared_taxable = sum(items[i]["price"] for i in shared_idxs if items[i].get("taxable"))
@@ -183,7 +245,6 @@ def calculate_bill(session: dict) -> str:
             base[p] += shared_total / n
             taxable[p] += shared_taxable / n
 
-    # Assigned items
     for p_idx, item_idxs in assignments.items():
         p = int(p_idx)
         for i in item_idxs:
@@ -191,20 +252,36 @@ def calculate_bill(session: dict) -> str:
             if items[i].get("taxable"):
                 taxable[p] += items[i]["price"]
 
+    # Detect rates from receipt totals
+    items_sum = sum(it["price"] for it in items)
+    taxable_sum = sum(it["price"] for it in items if it.get("taxable"))
+    sc_total = receipt.get("sc", 0.0)
+    gst_total = receipt.get("gst", 0.0)
+
+    sc_rate = (sc_total / items_sum) if items_sum > 0 and sc_total > 0 else 0.0
+    gst_base = taxable_sum + sc_total
+    gst_rate = (gst_total / gst_base) if gst_base > 0 and gst_total > 0 else 0.0
+
     lines = ["🧾 *Bill Breakdown*\n"]
     grand = 0.0
     payer = session["payer_name"]
 
     for p in range(n):
-        sc = base[p] * SC_RATE
-        gst = (taxable[p] + sc) * GST_RATE
-        total = base[p] + sc + gst
+        person_sc = base[p] * sc_rate
+        person_gst = (taxable[p] + person_sc) * gst_rate
+        total = base[p] + person_sc + person_gst
         grand += total
         suffix = "(you paid)" if people[p] == payer else "owes you"
         lines.append(f"👤 *{people[p]}* {suffix} — MVR {total:.2f}")
 
     lines.append(f"\n💰 *Grand Total: MVR {grand:.2f}*")
-    lines.append("_10% SC on all items, 8% GST on T-marked items + SC_")
+    note_parts = []
+    if sc_rate > 0:
+        note_parts.append(f"{sc_rate*100:.0f}% SC")
+    if gst_rate > 0:
+        note_parts.append(f"{gst_rate*100:.0f}% GST")
+    if note_parts:
+        lines.append(f"_(applied: {' + '.join(note_parts)})_")
     return "\n".join(lines)
 
 
@@ -282,6 +359,7 @@ async def split_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sessions[chat_id] = {
         "items": receipt["items"],
+        "receipt": receipt,
         "shared_items": shared_idxs,
         "people": [],
         "assignments": {},
