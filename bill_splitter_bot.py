@@ -100,15 +100,12 @@ def ocr_with_datalab(image_bytes: bytes) -> str:
 # ─────────────────────────────────────────────
 # REGEX RECEIPT PARSER (no AI quota needed)
 # ─────────────────────────────────────────────
-# Pizano format: "Korean BBQ Dirty Fries  1 pcs T  84.00"
+# Pizano-style: "Name X pcs [T] price"
 ITEM_LINE = re.compile(
     r"^(.+?)\s+(\d+)\s*pcs?\b\s*(T\b)?\s*([\d,]+\.\d{2})\s*$", re.IGNORECASE
 )
-# Jim & Carry format: numeric-only row like "134.25  2  228.22" (rate, qty, amount)
-THREE_NUMS = re.compile(
-    r"^([\d,]+[.,]\d{1,3})\s+(\d+)\s+([\d,]+[.,]\d{1,3})\s*$"
-)
-NUMBERS_ONLY = re.compile(r"^[\d,.\s]+$")
+NUM_PAT = re.compile(r"\d+(?:[.,]\d{1,3})?")
+NUMBERS_ONLY = re.compile(r"^[\d,.\s/]+$")
 
 
 def parse_num(s: str) -> float:
@@ -116,7 +113,6 @@ def parse_num(s: str) -> float:
     if "." in s and "," in s:
         return float(s.replace(",", ""))
     if "," in s and "." not in s:
-        # "264,42" → 264.42  ;  "2,500" → 2500
         parts = s.split(",")
         if len(parts[-1]) == 2:
             return float(s.replace(",", "."))
@@ -141,6 +137,107 @@ def is_total_line(lower: str) -> bool:
     ) or lower.startswith("total")
 
 
+def is_metadata_line(lower: str) -> bool:
+    return any(kw in lower for kw in (
+        "invoice", "cashier", "table", "floor", "dine", "tin ", "tin:",
+        "till", "date ", "date:", "time ", "time:", "contact",
+        "fill no", "order taken", "thank", "scan", "powered",
+        "come again", "unsettled", "kot ", "bot ", "bill :", "bill:",
+    )) or re.match(r"^(item|qty|rate|amt|amount|dish|description)\b", lower)
+
+
+def find_numbers(line: str):
+    """Return list of (value, start, end, has_decimal) for each number in line."""
+    out = []
+    for m in NUM_PAT.finditer(line):
+        s = m.group()
+        out.append((parse_num(s), m.start(), m.end(), "." in s or "," in s))
+    return out
+
+
+def text_excluding(line: str, nums) -> str:
+    """Text with numbers removed, picking the longest contiguous text chunk."""
+    if not nums:
+        return line.strip()
+    chunks = []
+    last = 0
+    for _, s, e, _ in nums:
+        chunks.append(line[last:s])
+        last = e
+    chunks.append(line[last:])
+    chunks = [c.strip(" \t-:|") for c in chunks]
+    chunks = [c for c in chunks if len(c) > 1]
+    return max(chunks, key=len) if chunks else ""
+
+
+def is_qty(v) -> bool:
+    return v == round(v) and 1 <= v <= 99
+
+
+def close_ratio(a: float, b: float, tol: float = 0.35) -> bool:
+    """Whether two numbers are within tol fractional difference (handles discounts)."""
+    if a <= 0 or b <= 0:
+        return False
+    return abs(a - b) / max(a, b) <= tol
+
+
+def try_parse_item(line: str, next_line: str = None):
+    """Try to extract one item. Returns (item_dict, lines_consumed) or (None, 0)."""
+    # Pizano-style "X pcs [T] price"
+    m = ITEM_LINE.match(line)
+    if m:
+        return {
+            "name": m.group(1).strip(),
+            "price": parse_num(m.group(4)),
+            "qty": int(m.group(2)),
+            "taxable": m.group(3) is not None,
+        }, 1
+
+    nums = find_numbers(line)
+    if not nums:
+        return None, 0
+
+    name_here = text_excluding(line, nums)
+
+    # 3 numbers: try (rate, qty, amount) and (qty, rate, amount) layouts.
+    # Prefer the integer-formatted (non-decimal) number as qty.
+    if len(nums) == 3:
+        a, _, _, a_dec = nums[0]
+        b, _, _, b_dec = nums[1]
+        c, _, _, c_dec = nums[2]
+
+        # rate × qty ≈ amount, qty in middle (e.g. "134.25  2  228.22")
+        if is_qty(b) and not b_dec and close_ratio(a * b, c):
+            name = name_here
+            consumed = 1
+            if not name and next_line and not is_total_line(next_line.lower()) \
+                    and not is_metadata_line(next_line.lower()) \
+                    and not NUMBERS_ONLY.match(next_line):
+                name = next_line.strip()
+                consumed = 2
+            if name and len(name) > 1:
+                return {"name": name, "price": c, "qty": int(b), "taxable": False}, consumed
+
+        # qty × rate ≈ amount, qty first (e.g. "2  Burger  50.00  100.00")
+        if is_qty(a) and not a_dec and close_ratio(a * b, c):
+            name = name_here
+            if name and len(name) > 1:
+                return {"name": name, "price": c, "qty": int(a), "taxable": False}, 1
+
+    # 2 numbers: "Name qty price" or "qty Name price"
+    if len(nums) == 2 and name_here and len(name_here) > 1:
+        a, _, _, _ = nums[0]
+        b, _, _, _ = nums[1]
+        if is_qty(a) and not nums[0][3]:  # first is integer-looking → qty
+            return {"name": name_here, "price": b, "qty": int(a), "taxable": False}, 1
+
+    # 1 number: "Name price"
+    if len(nums) == 1 and nums[0][3] and name_here and len(name_here) > 1:
+        return {"name": name_here, "price": nums[0][0], "qty": 1, "taxable": False}, 1
+
+    return None, 0
+
+
 def parse_receipt_text(text: str) -> dict:
     items = []
     subtotal = sc = gst = total = 0.0
@@ -161,53 +258,22 @@ def parse_receipt_text(text: str) -> dict:
         if ("gst" in lower or "tax amount" in lower or "vat" in lower) and "net" not in lower:
             gst = line_price(line) or gst
             i += 1; continue
-        if "net total" in lower or ("total" in lower and "sub" not in lower and "net[" not in lower and "net $" not in lower):
+        if "net total" in lower or ("total" in lower and "sub" not in lower
+                                    and "net[" not in lower and "net $" not in lower):
             total = line_price(line) or total
             i += 1; continue
 
-        # Skip other footer/header lines
-        if is_total_line(lower):
-            i += 1; continue
-        if any(kw in lower for kw in (
-            "invoice", "cashier", "table", "floor", "dine", "tin ", "tin:",
-            "till", "date ", "date:", "time ", "time:", "contact",
-            "fill no", "order taken", "rate", "qt.y", "qty", "amt",
-            "thank", "scan", "powered", "come again", "unsettled",
-            "kot ", "bot ", "bill :", "bill:",
-        )):
+        if is_total_line(lower) or is_metadata_line(lower):
             i += 1; continue
 
-        # Format A: Pizano single-line "Name X pcs [T] price"
-        m = ITEM_LINE.match(line)
-        if m:
-            items.append({
-                "name": m.group(1).strip(),
-                "price": parse_num(m.group(4)),
-                "qty": int(m.group(2)),
-                "taxable": m.group(3) is not None,
-            })
-            i += 1; continue
-
-        # Format B: Jim & Carry — "rate qty amount" then next line is name
-        m = THREE_NUMS.match(line)
-        if m and i + 1 < len(lines):
-            nxt = lines[i + 1]
-            nxt_lower = nxt.lower()
-            if (not NUMBERS_ONLY.match(nxt) and
-                not is_total_line(nxt_lower) and
-                len(nxt) > 2):
-                items.append({
-                    "name": nxt.strip(),
-                    "price": parse_num(m.group(3)),
-                    "qty": int(m.group(2)),
-                    "taxable": False,
-                })
-                i += 2
-                continue
+        item, consumed = try_parse_item(line, lines[i + 1] if i + 1 < len(lines) else None)
+        if item:
+            items.append(item)
+            i += consumed
+            continue
 
         i += 1
 
-    # If no T markers but receipt has GST → assume tax applies to all items
     if gst > 0 and not any(it.get("taxable") for it in items):
         for it in items:
             it["taxable"] = True
