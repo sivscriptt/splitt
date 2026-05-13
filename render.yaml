@@ -7,5 +7,5 @@ services:
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false
-      - key: GEMINI_API_KEY
+      - key: DATALAB_API_KEY
         sync: false
