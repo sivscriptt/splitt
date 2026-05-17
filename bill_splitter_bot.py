@@ -143,6 +143,7 @@ def is_metadata_line(lower: str) -> bool:
         "till", "date ", "date:", "time ", "time:", "contact",
         "fill no", "order taken", "thank", "scan", "powered",
         "come again", "unsettled", "kot ", "bot ", "bill :", "bill:",
+        "bill no", "signature", "reprint", "tendered", "balance amount",
     )) or re.match(r"^(item|qty|rate|amt|amount|dish|description)\b", lower)
 
 
