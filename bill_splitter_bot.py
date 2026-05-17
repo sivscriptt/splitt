@@ -232,6 +232,21 @@ def try_parse_item(line: str, next_line: str = None):
         if is_qty(a) and not nums[0][3]:  # first is integer-looking → qty
             return {"name": name_here, "price": b, "qty": int(a), "taxable": False}, 1
 
+    # 2 numbers, both decimal and ~equal: OCR dropped qty=1 ("rate amount")
+    if len(nums) == 2:
+        a, _, _, a_dec = nums[0]
+        b, _, _, b_dec = nums[1]
+        if a_dec and b_dec and abs(a - b) < 0.01:
+            name = name_here
+            consumed = 1
+            if not name and next_line and not is_total_line(next_line.lower()) \
+                    and not is_metadata_line(next_line.lower()) \
+                    and not NUMBERS_ONLY.match(next_line):
+                name = next_line.strip()
+                consumed = 2
+            if name and len(name) > 1:
+                return {"name": name, "price": b, "qty": 1, "taxable": False}, consumed
+
     # 1 number: "Name price"
     if len(nums) == 1 and nums[0][3] and name_here and len(name_here) > 1:
         return {"name": name_here, "price": nums[0][0], "qty": 1, "taxable": False}, 1
