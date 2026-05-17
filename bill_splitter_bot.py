@@ -339,6 +339,15 @@ def calculate_bill(session: dict) -> str:
     taxable_sum = sum(it["price"] for it in items if it.get("taxable"))
     sc_total = receipt.get("sc", 0.0)
     gst_total = receipt.get("gst", 0.0)
+    captured_subtotal = receipt.get("subtotal", 0.0)
+    captured_total = receipt.get("total", 0.0)
+
+    # If Net Total was captured but subtotal+sc+gst doesn't reconcile to it,
+    # trust the Net Total and attribute the gap to GST (most often mis-OCR'd).
+    if captured_total > 0 and captured_subtotal > 0:
+        expected = captured_subtotal + sc_total + gst_total
+        if abs(expected - captured_total) > max(1.0, captured_total * 0.02):
+            gst_total = max(0.0, captured_total - captured_subtotal - sc_total)
 
     sc_rate = (sc_total / items_sum) if items_sum > 0 and sc_total > 0 else 0.0
     gst_base = taxable_sum + sc_total
