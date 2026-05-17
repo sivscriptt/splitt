@@ -566,14 +566,24 @@ def run_health_server():
     HTTPServer(("", port), Handler).serve_forever()
 
 
+async def on_startup(app: Application) -> None:
+    # Clear any stale webhook + drop backlog so polling starts clean.
+    await app.bot.delete_webhook(drop_pending_updates=True)
+
+
 def main():
     threading.Thread(target=run_health_server, daemon=True).start()
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(on_startup)
+        .build()
+    )
     app.add_handler(CommandHandler("split", split_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
     logger.info("Bot running...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
